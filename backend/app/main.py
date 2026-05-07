@@ -1,0 +1,148 @@
+"""
+FastAPI application entrypoint.
+Startup: connect MongoDB → seed data → train ML models.
+"""
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from app.utils.database import connect_to_mongo, close_mongo, get_db
+
+from app.ml.engine import ml_engine
+from app.routes import auth, products, interactions, recommendations, cart, orders, profile
+from app.schemas.schemas import HealthResponse
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+APP_VERSION = "2.0.0"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("=== Smart Recommendation System v2.0 Starting ===")
+    db = connect_to_mongo()
+
+    # Smart seeding: Only seed if database is completely empty
+    if db.products.count_documents({}) == 0:
+        from app.utils.seed_data import seed_database
+        seed_database(db)
+
+    # Train ML models using existing MongoDB data
+    ml_engine.fit(db)
+    logger.info("=== System Ready ===")
+    yield
+    close_mongo()
+    logger.info("=== System Stopped ===")
+
+
+app = FastAPI(
+    title="Smart Product Recommendation System",
+    description="Production recommendation engine with MongoDB, JWT auth, and hybrid ML strategy.",
+    version=APP_VERSION,
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+from fastapi.responses import JSONResponse
+from fastapi import Request, HTTPException
+from fastapi.exceptions import RequestValidationError
+import time
+from datetime import datetime
+import traceback
+
+@app.middleware("http")
+async def log_requests_middleware(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    logger.info(
+        f"Request: {request.method} {request.url.path} "
+        f"- Status: {response.status_code} "
+        f"- {process_time * 1000:.2f}ms"
+    )
+    return response
+
+def _format_error(status_code: int, message: str, request: Request, detail: any = None) -> dict:
+    return {
+        "error": True,
+        "status_code": status_code,
+        "message": message,
+        "path": request.url.path,
+        "timestamp": datetime.utcnow().isoformat(),
+        "detail": detail
+    }
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_format_error(exc.status_code, str(exc.detail), request)
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content=_format_error(422, "Validation Error", request, exc.errors())
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled Exception: {str(exc)}\n{traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content=_format_error(500, "An unexpected error occurred. Please try again later.", request)
+    )
+
+cors_origins = [o.strip() for o in os.getenv(
+    "CORS_ORIGINS", "http://localhost:3000,http://localhost:5173"
+).split(",")]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+PREFIX = "/api/v1"
+app.include_router(auth.router, prefix=PREFIX)
+app.include_router(products.router, prefix=PREFIX)
+app.include_router(interactions.router, prefix=PREFIX)
+app.include_router(recommendations.router, prefix=PREFIX)
+app.include_router(cart.router, prefix=PREFIX)
+app.include_router(orders.router, prefix=PREFIX)
+app.include_router(profile.router, prefix=PREFIX)
+
+
+@app.get("/health", response_model=HealthResponse, tags=["System"])
+def health_check():
+    db = get_db()
+    return HealthResponse(
+        status="healthy",
+        version=APP_VERSION,
+        total_users=db.users.count_documents({}),
+        total_products=db.products.count_documents({}),
+        total_interactions=db.interactions.count_documents({}),
+        ml_engine_ready=ml_engine.is_ready,
+    )
+
+
+@app.get("/", tags=["System"])
+def root():
+    return {
+        "message": "Smart Product Recommendation System v2.0",
+        "docs": "/docs",
+        "health": "/health",
+        "auth": {"signup": "POST /api/v1/auth/signup", "login": "POST /api/v1/auth/login"},
+        "public": ["GET /api/v1/products", "GET /api/v1/products/{id}"],
+        "protected": ["GET /api/v1/home", "GET /api/v1/recommend/user",
+                      "GET /api/v1/cart", "POST /api/v1/orders/place"],
+    }
+# trigger reload
